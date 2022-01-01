@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"regexp"
 	"sync"
+	"time"
 
 	"../models"
 
@@ -31,7 +32,14 @@ func (m *Master) NumberOfIdle() int {
 	}
 	return count
 }
-
+func (m *Master) Reexecute(k string) {
+	time.Sleep(10 * time.Second)
+	if m.MapTasks[k].State == models.Inprogress {
+		log.Info("Worker ", m.MapTasks[k].WorkerID+" is reponsible for "+m.MapTasks[k].Key+", But its processing exceeds the time.")
+		m.MapTasks[k].State = models.Idle
+		m.MapTasks[k].WorkerID = ""
+	}
+}
 func (m *Master) HeartBeat(w *Worker) bool {
 	reply := models.KeyValue{}
 	// if !IsOpened(w.Host, w.Port) {
@@ -42,10 +50,12 @@ func (m *Master) HeartBeat(w *Worker) bool {
 
 func (m *Master) DispatchTask() int {
 	if len(m.WorkerQueue) > 0 && len(m.Workers) > 0 {
+		isFinished := false
 		cur := m.WorkerQueue[0]
 		m.WorkerQueue = m.WorkerQueue[1:]
 		for k, v := range m.MapTasks {
 			if v.State == models.Idle {
+				isFinished = false
 				tsk := &models.MapTask{
 					TaskInfo: models.TaskInfo{
 						Key:      k,
@@ -54,32 +64,41 @@ func (m *Master) DispatchTask() int {
 					Value: m.MapTasks[k].Value,
 				}
 				m.MapTasks[k].State = models.Inprogress
+				m.MapTasks[k].WorkerID = cur
 				m.Workers[cur].State = Busy
 				reply := models.KeyValue{}
 				m.call(m.Workers[cur].Id, "Worker.DispatchMapTask", tsk, &reply)
+				go m.Reexecute(k)
 				log.Info("Deliveried ", tsk.Value, " map task to worker ", cur)
 				return 1
 			}
+			if v.State == models.Inprogress {
+				isFinished = false
+			}
 		}
-		for k, v := range m.ReduceTasks {
-			if v.State == models.Idle {
-				values := make([]string, 0, len(m.ReduceTasks[k].Value))
-				for k := range m.ReduceTasks[k].Value {
-					values = append(values, k)
+		if isFinished {
+			for k, v := range m.ReduceTasks {
+				if v.State == models.Idle {
+					values := make([]string, 0, len(m.ReduceTasks[k].Value))
+					for k := range m.ReduceTasks[k].Value {
+						values = append(values, k)
+					}
+					tsk := &models.ReduceTaskWorker{
+						TaskInfo: models.TaskInfo{
+							Key:      k,
+							WorkerID: cur,
+						},
+						Value: values,
+					}
+					m.ReduceTasks[k].State = models.Inprogress
+					m.MapTasks[k].WorkerID = cur
+					m.Workers[cur].State = Busy
+					reply := models.KeyValue{}
+					m.call(m.Workers[cur].Id, "Worker.DispatchReduceTask", tsk, &reply)
+					go m.Reexecute(k)
+					log.Info("Deliveried ", tsk.Value, " reduce task to worker ", cur)
+					return 1
 				}
-				tsk := &models.ReduceTaskWorker{
-					TaskInfo: models.TaskInfo{
-						Key:      k,
-						WorkerID: cur,
-					},
-					Value: values,
-				}
-				m.ReduceTasks[k].State = models.Inprogress
-				m.Workers[cur].State = Busy
-				reply := models.KeyValue{}
-				m.call(m.Workers[cur].Id, "Worker.DispatchReduceTask", tsk, &reply)
-				log.Info("Deliveried ", tsk.Value, " reduce task to worker ", cur)
-				return 1
 			}
 		}
 		return 0
@@ -103,52 +122,72 @@ func (m *Master) GetMapTask(args int, reply *models.KeyValue) error {
 }
 
 func (m *Master) DoneReduceTask(tsk models.ReduceTaskResponse, reply *models.KeyValue) error {
-	// marking completed
-	m.ReduceTasks[tsk.Key].State = models.Completed
-	m.WorkerMutex.Lock()
-	// free worker
-	if m.Workers[tsk.WorkerID].State == Busy {
-		m.Workers[tsk.WorkerID].State = Free
-		m.WorkerQueue = append(m.WorkerQueue, tsk.WorkerID)
+	if tsk.WorkerID == m.MapTasks[tsk.Key].WorkerID {
+		if m.MapTasks[tsk.Key].State == models.Completed {
+			log.Info(tsk.WorkerID, " submits task ", tsk.Key, ". But its finished before.")
+		} else {
+			// marking completed
+			m.ReduceTasks[tsk.Key].State = models.Completed
+			m.WorkerMutex.Lock()
+			// free worker
+			if m.Workers[tsk.WorkerID].State == Busy {
+				m.Workers[tsk.WorkerID].State = Free
+				m.WorkerQueue = append(m.WorkerQueue, tsk.WorkerID)
+				// log.Info("Reduce Task ", tsk.Key, " has been done")
+			} else {
+				log.Info(" Submit task response from failed worker ", tsk.WorkerID)
+			}
+			m.WorkerMutex.Unlock()
+		}
 	} else {
-		log.Info(" Submit task response from failed worker ", tsk.WorkerID)
+		log.Info(tsk.WorkerID, " submits task ", tsk.Key, " lately. And Its finished by worker "+m.MapTasks[tsk.Key].WorkerID)
 	}
-	m.WorkerMutex.Unlock()
-	log.Info("Reduce Task ", tsk.Key, " has been done")
 	return nil
 }
 
 func (m *Master) DoneMapTask(tsk models.MapTaskResponse, reply *models.KeyValue) error {
-	// marking completed
-	m.MapTasks[tsk.Key].State = models.Completed
+	if tsk.WorkerID == m.MapTasks[tsk.Key].WorkerID {
+		if m.MapTasks[tsk.Key].State == models.Completed {
+			log.Info(tsk.WorkerID, " submits task ", tsk.Key, ". But its finished before.")
+		} else {
+			// marking completed
+			m.MapTasks[tsk.Key].State = models.Completed
 
-	// initing new reduce task relatively
-	for _, v := range tsk.Value {
-		if _, ok := m.ReduceTasks[v.Key]; !ok {
-			m.ReduceTasks[v.Key] = &models.ReduceTaskMaster{
-				TaskInfo: models.TaskInfo{
-					WorkerID: tsk.WorkerID,
-					Key:      tsk.Key,
-					State:    models.Idle,
-				},
-				Value: make(map[string]bool),
+			// initing new reduce task relatively
+			for _, v := range tsk.Value {
+				if _, ok := m.ReduceTasks[v.Key]; !ok {
+					m.ReduceTasks[v.Key] = &models.ReduceTaskMaster{
+						TaskInfo: models.TaskInfo{
+							WorkerID: tsk.WorkerID,
+							Key:      tsk.Key,
+							State:    models.Idle,
+						},
+						Value: make(map[string]bool),
+					}
+				}
+				tmp := m.ReduceTasks[v.Key].Value
+				tmp[v.Value] = true
+				m.ReduceTasks[v.Key].Value = tmp
 			}
-		}
-		tmp := m.ReduceTasks[v.Key].Value
-		tmp[v.Value] = true
-		m.ReduceTasks[v.Key].Value = tmp
-	}
 
-	// free worker
-	m.WorkerMutex.Lock()
-	if m.Workers[tsk.WorkerID].State == Busy {
-		m.Workers[tsk.WorkerID].State = Free
-		m.WorkerQueue = append(m.WorkerQueue, tsk.WorkerID)
+			// free worker
+			m.WorkerMutex.Lock()
+			if m.Workers[tsk.WorkerID].State == Busy {
+				m.Workers[tsk.WorkerID].State = Free
+				m.WorkerQueue = append(m.WorkerQueue, tsk.WorkerID)
+				log.Info("Map Task ", tsk.Key, " is done by worker ", tsk.WorkerID)
+			} else {
+				if m.Workers[tsk.WorkerID].State == Failed {
+					log.Info(tsk.WorkerID, " submits task ", tsk.Key, " in state Failed")
+				} else {
+					log.Info(tsk.WorkerID, " submits task ", tsk.Key, " in state Free")
+				}
+			}
+			m.WorkerMutex.Unlock()
+		}
 	} else {
-		log.Info(" Submit task response from failed worker ", tsk.WorkerID)
+		log.Info(tsk.WorkerID, " submits task ", tsk.Key, " lately. And Its finished by worker "+m.MapTasks[tsk.Key].WorkerID)
 	}
-	m.WorkerMutex.Unlock()
-	log.Info("Map Task ", tsk.Key, " has been done")
 	return nil
 }
 

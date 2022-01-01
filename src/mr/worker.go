@@ -120,10 +120,10 @@ func (w *Worker) Map(mapf func(string, string) []models.KeyValue, task models.Ma
 			WorkerID: w.Id,
 		}
 		for !w.DoneMapTask(tskReply) {
-			log.Info("Map Task has something wrong ", oname)
+			log.Info("Map Task has something wrong ", oname+pre+".txt")
 			time.Sleep(5 * time.Second)
 		}
-		log.Info(" successfully notified ", oname)
+		log.Info(" Finishing Map task at ", oname+pre+".txt")
 	}
 }
 

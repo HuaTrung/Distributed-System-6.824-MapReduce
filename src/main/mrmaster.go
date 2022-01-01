@@ -29,7 +29,6 @@ func main() {
 	}
 	m := mr.MakeMaster(os.Args[1:], 10, uti.GetPath())
 	for m.Done() == false {
-		// time.Sleep(2 * time.Second)
 		m.WorkerMutex.Lock()
 		for _, w := range m.Workers {
 			if w.State != mr.Failed {
@@ -55,10 +54,6 @@ func main() {
 
 		m.DispatchTask()
 		m.WorkerMutex.Unlock()
-		// log.WithFields(log.Fields{
-		// 	"workers": len(m.Workers),
-		// 	"idle":    m.NumberOfIdle(),
-		// }).Info("Worker: ")
 	}
 
 	time.Sleep(time.Second)
